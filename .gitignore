@@ -162,3 +162,13 @@ cython_debug/
 
 weights
 data
+archive-2019/
+archive-2020/
+archive-2021/
+
+final_data2019/
+final_data2020/
+final_data2021/
+test_results/
+test_dir
+
