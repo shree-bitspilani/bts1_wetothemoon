@@ -53,7 +53,7 @@ class BrainTumorSegmentationTester:
     def __init__(self, 
                  test_dir='/data/aniket/BrainTumorSegmentation/test_dir',
                  output_dir='/data/aniket/BrainTumorSegmentation/test_results',
-                 binary_weights='/data/aniket/BrainTumorSegmentation/final_data2021/binary/BinaryWeights.hdf5',
+                 binary_weights='/data/aniket/BrainTumorSegmentation/weights/BinaryWeights.hdf5',
                  multiclass_weights='/data/aniket/BrainTumorSegmentation/weights/weights_1000instances.h5',
                  save_intermediate=True,
                  use_ground_truth_space=True):
@@ -1192,15 +1192,11 @@ class BrainTumorSegmentationTester:
             else:
                 failed += 1
         
-        # Calculate overall evaluation statistics
-        overall_evaluation = self.calculate_overall_evaluation_stats(results)
-        
         # Generate overall summary
         summary = {
             'total_patients': len(patient_dirs),
             'successful': successful,
             'failed': failed,
-            'overall_evaluation': overall_evaluation,
             'results': results,
             'timestamp': datetime.now().isoformat()
         }
@@ -1215,122 +1211,8 @@ class BrainTumorSegmentationTester:
         logger.info(f"Total patients: {len(patient_dirs)}")
         logger.info(f"Successful: {successful}")
         logger.info(f"Failed: {failed}")
-        
-        # Log overall evaluation statistics
-        if overall_evaluation['patients_with_ground_truth'] > 0:
-            logger.info(f"Evaluation Summary:")
-            logger.info(f"  Patients with ground truth: {overall_evaluation['patients_with_ground_truth']}")
-            logger.info(f"  Mean Binary Dice: {overall_evaluation['mean_binary_dice']:.4f}")
-            logger.info(f"  Mean Multiclass Dice: {overall_evaluation['mean_multiclass_dice']:.4f}")
-            
-            if overall_evaluation['resampled_stats']['patients_evaluated'] > 0:
-                logger.info(f"  Resampled Mean Binary Dice: {overall_evaluation['resampled_stats']['mean_binary_dice']:.4f}")
-                logger.info(f"  Resampled Mean Multiclass Dice: {overall_evaluation['resampled_stats']['mean_multiclass_dice']:.4f}")
-        
         logger.info(f"Results saved to: {self.output_dir}")
         logger.info(f"Summary: {summary_path}")
-
-    def calculate_overall_evaluation_stats(self, results):
-        """Calculate overall evaluation statistics across all patients."""
-        logger.info("Calculating overall evaluation statistics...")
-        
-        binary_dice_scores = []
-        multiclass_dice_scores = []
-        resampled_binary_dice_scores = []
-        resampled_multiclass_dice_scores = []
-        
-        patients_with_gt = 0
-        patients_with_resampled_eval = 0
-        class_dice_accumulator = {}
-        resampled_class_dice_accumulator = {}
-        
-        for result in results:
-            if not result['success'] or 'evaluation' not in result:
-                continue
-                
-            evaluation = result['evaluation']
-            
-            if evaluation.get('has_ground_truth', False) and 'evaluation_error' not in evaluation:
-                patients_with_gt += 1
-                
-                # Binary dice scores
-                if 'binary_evaluation' in evaluation and 'dice_score' in evaluation['binary_evaluation']:
-                    binary_dice_scores.append(evaluation['binary_evaluation']['dice_score'])
-                
-                # Multiclass dice scores
-                if 'multiclass_evaluation' in evaluation:
-                    mc_eval = evaluation['multiclass_evaluation']
-                    if 'mean_dice' in mc_eval:
-                        multiclass_dice_scores.append(mc_eval['mean_dice'])
-                    
-                    # Accumulate individual class scores
-                    for class_id, class_info in mc_eval.items():
-                        if isinstance(class_info, dict) and 'dice_score' in class_info:
-                            if class_id not in class_dice_accumulator:
-                                class_dice_accumulator[class_id] = []
-                            class_dice_accumulator[class_id].append(class_info['dice_score'])
-                
-                # Resampled evaluation scores
-                if 'resampled_evaluation' in evaluation:
-                    patients_with_resampled_eval += 1
-                    resamp_eval = evaluation['resampled_evaluation']
-                    
-                    if 'binary_evaluation' in resamp_eval and 'dice_score' in resamp_eval['binary_evaluation']:
-                        resampled_binary_dice_scores.append(resamp_eval['binary_evaluation']['dice_score'])
-                    
-                    if 'multiclass_evaluation' in resamp_eval:
-                        mc_eval = resamp_eval['multiclass_evaluation']
-                        if 'mean_dice' in mc_eval:
-                            resampled_multiclass_dice_scores.append(mc_eval['mean_dice'])
-                        
-                        # Accumulate resampled individual class scores
-                        for class_id, class_info in mc_eval.items():
-                            if isinstance(class_info, dict) and 'dice_score' in class_info:
-                                if class_id not in resampled_class_dice_accumulator:
-                                    resampled_class_dice_accumulator[class_id] = []
-                                resampled_class_dice_accumulator[class_id].append(class_info['dice_score'])
-        
-        # Calculate mean scores for each class
-        class_mean_dice = {}
-        for class_id, scores in class_dice_accumulator.items():
-            class_name = self.label_mapping.get(int(class_id), f"Class_{class_id}")
-            class_mean_dice[int(class_id)] = {
-                'name': class_name,
-                'mean_dice': round(np.mean(scores), 4),
-                'std_dice': round(np.std(scores), 4),
-                'count': len(scores)
-            }
-        
-        resampled_class_mean_dice = {}
-        for class_id, scores in resampled_class_dice_accumulator.items():
-            class_name = self.label_mapping.get(int(class_id), f"Class_{class_id}")
-            resampled_class_mean_dice[int(class_id)] = {
-                'name': class_name,
-                'mean_dice': round(np.mean(scores), 4),
-                'std_dice': round(np.std(scores), 4),
-                'count': len(scores)
-            }
-        
-        overall_stats = {
-            'patients_with_ground_truth': patients_with_gt,
-            'patients_evaluated': len([r for r in results if r['success']]),
-            'mean_binary_dice': round(np.mean(binary_dice_scores), 4) if binary_dice_scores else 0.0,
-            'std_binary_dice': round(np.std(binary_dice_scores), 4) if binary_dice_scores else 0.0,
-            'mean_multiclass_dice': round(np.mean(multiclass_dice_scores), 4) if multiclass_dice_scores else 0.0,
-            'std_multiclass_dice': round(np.std(multiclass_dice_scores), 4) if multiclass_dice_scores else 0.0,
-            'individual_class_stats': class_mean_dice,
-            'resampled_stats': {
-                'patients_evaluated': patients_with_resampled_eval,
-                'mean_binary_dice': round(np.mean(resampled_binary_dice_scores), 4) if resampled_binary_dice_scores else 0.0,
-                'std_binary_dice': round(np.std(resampled_binary_dice_scores), 4) if resampled_binary_dice_scores else 0.0,
-                'mean_multiclass_dice': round(np.mean(resampled_multiclass_dice_scores), 4) if resampled_multiclass_dice_scores else 0.0,
-                'std_multiclass_dice': round(np.std(resampled_multiclass_dice_scores), 4) if resampled_multiclass_dice_scores else 0.0,
-                'individual_class_stats': resampled_class_mean_dice
-            }
-        }
-        
-        logger.info(f"Overall evaluation completed for {patients_with_gt} patients with ground truth")
-        return overall_stats
 
 
 def main():
@@ -1340,7 +1222,7 @@ def main():
                        help='Directory containing test NIfTI files')
     parser.add_argument('--output_dir', default='test_results',
                        help='Directory to save results')
-    parser.add_argument('--binary_weights', default='/data/aniket/BrainTumorSegmentation/final_data2021/binary/BinaryWeights.hdf5',
+    parser.add_argument('--binary_weights', default='/data/aniket/BrainTumorSegmentation/weights/BinaryWeights.hdf5',
                        help='Path to binary model weights')
     parser.add_argument('--multiclass_weights', default='/data/aniket/BrainTumorSegmentation/weights/weights_1000instances.h5',
                        help='Path to multiclass model weights')
