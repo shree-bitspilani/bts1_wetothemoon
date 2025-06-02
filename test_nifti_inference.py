@@ -56,7 +56,8 @@ class BrainTumorSegmentationTester:
                  binary_weights='/data/aniket/BrainTumorSegmentation/weights/BinaryWeights.hdf5',
                  multiclass_weights='/data/aniket/BrainTumorSegmentation/weights/weights_1000instances.h5',
                  save_intermediate=True,
-                 use_ground_truth_space=True):
+                 use_ground_truth_space=True,
+                 use_training_style_preprocessing=True):
         
         self.test_dir = Path(test_dir)
         self.output_dir = Path(output_dir)
@@ -64,6 +65,7 @@ class BrainTumorSegmentationTester:
         self.multiclass_weights = multiclass_weights
         self.save_intermediate = save_intermediate
         self.use_ground_truth_space = use_ground_truth_space
+        self.use_training_style_preprocessing = use_training_style_preprocessing
         
         # Create output directories
         self.output_dir.mkdir(exist_ok=True)
@@ -88,6 +90,7 @@ class BrainTumorSegmentationTester:
         logger.info(f"Initialized tester with test_dir: {self.test_dir}")
         logger.info(f"Output directory: {self.output_dir}")
         logger.info(f"Use ground truth space for resampling: {self.use_ground_truth_space}")
+        logger.info(f"Use training-style preprocessing: {self.use_training_style_preprocessing}")
     
     def load_models(self):
         """Load the trained binary and multiclass models."""
@@ -358,6 +361,355 @@ class BrainTumorSegmentationTester:
             evaluation_results['evaluation_error'] = str(e)
         
         return evaluation_results
+
+    def calc_z_score_training_style(self, img):
+        """
+        Calculate z-score normalization exactly as done in training.
+        Based on utils.preprocessing.calc_z_score()
+        """
+        img_normalized = img.copy().astype(np.float32)
+        
+        # Only normalize non-zero voxels
+        non_zero_mask = img_normalized != 0
+        if np.sum(non_zero_mask) > 0:
+            avg_pixel_value = np.sum(img_normalized) / np.count_nonzero(img_normalized)
+            sd_pixel_value = np.std(img_normalized[non_zero_mask])
+            
+            if sd_pixel_value > 0:
+                for i in range(img_normalized.shape[0]):
+                    for j in range(img_normalized.shape[1]):
+                        for k in range(img_normalized.shape[2]):
+                            if img_normalized[i, j, k] != 0:
+                                img_normalized[i, j, k] = (img_normalized[i, j, k] - avg_pixel_value) / sd_pixel_value
+        
+        return img_normalized
+
+    def preprocess_data_training_style(self, data_dict, patient_id):
+        """
+        Preprocess MRI data exactly as done during training.
+        Based on utils.preprocessing.normalize_mri_data()
+        
+        This function:
+        1. Crops from 240x240x155 to 128x128x128 using exact training indices
+        2. Applies z-score normalization per modality 
+        3. Stacks in training order: [flair, t1ce, t1, t2]
+        4. Handles mask preprocessing for ground truth
+        """
+        logger.info(f"Preprocessing data for {patient_id} using TRAINING-STYLE preprocessing")
+        
+        t1 = data_dict['t1']
+        t1ce = data_dict['t1ce'] 
+        t2 = data_dict['t2']
+        flair = data_dict['flair']
+        
+        logger.info(f"Original image shapes: T1={t1.shape}, T1CE={t1ce.shape}, T2={t2.shape}, FLAIR={flair.shape}")
+        
+        # CRITICAL: Use exact same cropping as training [56:184, 56:184, 13:141]
+        # This crops from (240, 240, 155) to (128, 128, 128)
+        crop_indices = (slice(56, 184), slice(56, 184), slice(13, 141))
+        
+        try:
+            # Crop each modality to training size
+            t2_cropped = t2[crop_indices]
+            t1ce_cropped = t1ce[crop_indices] 
+            flair_cropped = flair[crop_indices]
+            t1_cropped = t1[crop_indices]
+            
+            logger.info(f"Cropped shapes: T1={t1_cropped.shape}, T1CE={t1ce_cropped.shape}, T2={t2_cropped.shape}, FLAIR={flair_cropped.shape}")
+            
+            # Apply z-score normalization per modality (training style)
+            t2_norm = self.calc_z_score_training_style(t2_cropped)
+            t1ce_norm = self.calc_z_score_training_style(t1ce_cropped)
+            flair_norm = self.calc_z_score_training_style(flair_cropped)
+            t1_norm = self.calc_z_score_training_style(t1_cropped)
+            
+            # Stack in training order: [flair, t1ce, t1, t2]
+            normalized_data = np.stack([flair_norm, t1ce_norm, t1_norm, t2_norm], axis=3)
+            
+            logger.info(f"Final normalized data shape: {normalized_data.shape}")
+            
+            # Process ground truth mask if available
+            processed_mask = None
+            if 'seg' in data_dict:
+                mask = data_dict['seg']
+                mask_cropped = mask[crop_indices].astype(np.uint8)
+                
+                # Convert label 4 to 3 (training style)
+                mask_cropped[mask_cropped == 4] = 3
+                
+                # Create one-hot encoding (training style)
+                processed_mask = self.change_mask_shape_training_style(mask_cropped)
+                logger.info(f"Processed mask shape: {processed_mask.shape}")
+            else:
+                # Create dummy mask for compatibility
+                processed_mask = np.zeros((128, 128, 128, 4))
+            
+            # Save intermediate results if requested
+            if self.save_intermediate:
+                self.save_intermediate_nifti(
+                    normalized_data, 
+                    f"{patient_id}_normalized_training_style.nii.gz"
+                )
+                
+                if 'seg' in data_dict:
+                    self.save_intermediate_nifti(
+                        mask_cropped,
+                        f"{patient_id}_mask_cropped.nii.gz"
+                    )
+            
+            return normalized_data, processed_mask, crop_indices
+            
+        except Exception as e:
+            logger.error(f"Error in training-style preprocessing: {e}")
+            raise
+
+    def change_mask_shape_training_style(self, mask):
+        """
+        Convert mask to one-hot encoding exactly as done in training.
+        Based on utils.preprocessing.change_mask_shape()
+        """
+        if mask.shape == (128, 128, 128, 4):
+            logger.warning("Mask shape is already (128, 128, 128, 4)")
+            return mask
+
+        new_mask = np.zeros((128, 128, 128, 4))
+        for i in range(128):
+            for j in range(128):
+                for k in range(128):
+                    label = int(mask[i, j, k])
+                    if 0 <= label < 4:
+                        new_mask[i, j, k, label] = 1
+
+        return new_mask
+
+    def predict_binary_mask_training_style(self, normalized_data, patient_id):
+        """
+        Generate binary mask using training-style preprocessing.
+        Input data is already in 128x128x128 format from training-style preprocessing.
+        """
+        logger.info(f"Generating binary mask for {patient_id} using training-style data")
+        
+        try:
+            # Data is already 128x128x128x4 from training-style preprocessing
+            logger.info(f"Input data shape: {normalized_data.shape}")
+            
+            if normalized_data.shape[:3] != (128, 128, 128):
+                logger.error(f"Expected 128x128x128 input, got {normalized_data.shape[:3]}")
+                raise ValueError("Input data must be 128x128x128 for training-style processing")
+            
+            # Prepare input for binary model
+            img_input = np.expand_dims(normalized_data, axis=0)
+            
+            # Predict using binary model
+            binary_pred = self.binary_model.predict(img_input, verbose=0)
+            binary_mask = binary_pred[0, :, :, :, 0]
+            
+            # Threshold to get binary mask
+            binary_mask_thresh = (binary_mask > 0.5).astype(np.uint8)
+            
+            logger.info(f"Binary mask shape: {binary_mask_thresh.shape}")
+            logger.info(f"Binary mask unique values: {np.unique(binary_mask_thresh)}")
+            
+            # Save intermediate results
+            if self.save_intermediate:
+                self.save_intermediate_nifti(
+                    binary_mask_thresh,
+                    f"{patient_id}_binary_mask_training_style.nii.gz"
+                )
+                
+                self.save_intermediate_nifti(
+                    binary_mask,
+                    f"{patient_id}_binary_prob_training_style.nii.gz"
+                )
+            
+            return binary_mask_thresh
+            
+        except Exception as e:
+            logger.error(f"Error in training-style binary prediction: {e}")
+            raise
+
+    def crop_with_binary_mask_training_style(self, normalized_data, mask, binary_mask, patient_id):
+        """
+        Crop data using binary mask exactly as done during training.
+        Based on utils.preprocessing.roi_crop() and global_extraction()
+        """
+        logger.info(f"Cropping data using training-style ROI detection for {patient_id}")
+        
+        try:
+            # Use binary mask to find tumor location (training style)
+            binary_mask_expanded = np.expand_dims(binary_mask, axis=-1)
+            loc = np.where(binary_mask == 1)
+            
+            if len(loc[0]) == 0:
+                # No tumor detected, use center crop as fallback
+                logger.warning(f"No tumor region detected for {patient_id}, using center crop")
+                a, b = 40, 88  # Center crop for 48x48
+                c, d = 40, 88
+            else:
+                # ROI crop based on tumor location (training style)
+                thresh = 12
+                a = max(0, np.amin(loc[0]) - thresh)
+                b = min(128, np.amax(loc[0]) + thresh)
+                c = max(0, np.amin(loc[1]) - thresh)
+                d = min(128, np.amax(loc[1]) + thresh)
+
+                # Ensure minimum size of 48x48 (training requirement)
+                while abs(b - a) < 48:
+                    a = max(0, a - 1)
+                    b = min(128, b + 1)
+
+                while abs(d - c) < 48:
+                    c = max(0, c - 1)
+                    d = min(128, d + 1)
+            
+            # Store cropping coordinates for reconstruction
+            crop_coords = {
+                'h_start': a, 'h_end': b,
+                'w_start': c, 'w_end': d,
+                'd_start': 0, 'd_end': 128,
+                'original_shape': (128, 128, 128),  # Training uses 128x128x128 space
+                'training_style': True
+            }
+            
+            # Crop to ROI and add binary mask as 5th channel (training style)
+            cropped_img = normalized_data[a:b, c:d, :]  # 4 channels
+            cropped_binary = binary_mask[a:b, c:d, :]
+            
+            # Concatenate binary mask as 5th channel
+            img_with_binary = np.concatenate([cropped_img, binary_mask_expanded[a:b, c:d, :]], axis=-1)
+            
+            # Crop mask for compatibility
+            cropped_mask = mask[a:b, c:d, :]
+            
+            logger.info(f"ROI crop coordinates: [{a}:{b}, {c}:{d}, 0:128]")
+            logger.info(f"Cropped image with binary shape: {img_with_binary.shape}")
+            logger.info(f"Cropped mask shape: {cropped_mask.shape}")
+            
+            # For multiclass training, we need exactly 48x48x128x4 (without binary mask channel)
+            # This matches the training data preparation
+            final_cropped_img = cropped_img  # Use only the 4 MRI channels
+            
+            # Ensure exact 48x48x128 size by cropping or padding
+            target_h, target_w, target_d = 48, 48, 128
+            current_h, current_w, current_d = final_cropped_img.shape[:3]
+            
+            if (current_h, current_w, current_d) != (target_h, target_w, target_d):
+                # Center crop or pad to exact size
+                padded_img = np.zeros((target_h, target_w, target_d, 4))
+                padded_mask = np.zeros((target_h, target_w, target_d, 4))
+                
+                # Calculate copy region
+                copy_h = min(current_h, target_h)
+                copy_w = min(current_w, target_w)
+                copy_d = min(current_d, target_d)
+                
+                # Center the data
+                start_h = (target_h - copy_h) // 2
+                start_w = (target_w - copy_w) // 2
+                start_d = (target_d - copy_d) // 2
+                
+                padded_img[start_h:start_h+copy_h, start_w:start_w+copy_w, start_d:start_d+copy_d] = \
+                    final_cropped_img[:copy_h, :copy_w, :copy_d]
+                padded_mask[start_h:start_h+copy_h, start_w:start_w+copy_w, start_d:start_d+copy_d] = \
+                    cropped_mask[:copy_h, :copy_w, :copy_d]
+                
+                final_cropped_img = padded_img
+                cropped_mask = padded_mask
+                
+                # Update crop coordinates
+                crop_coords['padding'] = {
+                    'h_start': start_h, 'h_end': start_h + copy_h,
+                    'w_start': start_w, 'w_end': start_w + copy_w,
+                    'd_start': start_d, 'd_end': start_d + copy_d
+                }
+            
+            logger.info(f"Final cropped image shape: {final_cropped_img.shape}")
+            
+            # Save intermediate results
+            if self.save_intermediate:
+                self.save_intermediate_nifti(
+                    final_cropped_img,
+                    f"{patient_id}_cropped_training_style.nii.gz"
+                )
+            
+            return final_cropped_img, cropped_mask, crop_coords
+            
+        except Exception as e:
+            logger.error(f"Error in training-style cropping: {e}")
+            raise
+
+    def postprocess_segmentation_training_style(self, cropped_seg, crop_coords, original_shape, patient_id):
+        """
+        Postprocess segmentation from training-style processing back to original BraTS space.
+        This handles both the ROI crop reconstruction and the 128x128x128 to 240x240x155 expansion.
+        """
+        logger.info(f"Postprocessing segmentation for {patient_id} from training-style processing")
+        
+        try:
+            # Step 1: Reconstruct to 128x128x128 space (training space)
+            training_shape = crop_coords['original_shape']  # Should be (128, 128, 128)
+            logger.info(f"Reconstructing to training space: {training_shape}")
+            
+            # Initialize segmentation in training space
+            training_segmentation = np.zeros(training_shape, dtype=cropped_seg.dtype)
+            
+            # Handle padding if it was applied during cropping
+            if 'padding' in crop_coords:
+                # Remove padding from cropped segmentation first
+                padding = crop_coords['padding']
+                unpadded_seg = cropped_seg[
+                    padding['h_start']:padding['h_end'],
+                    padding['w_start']:padding['w_end'], 
+                    padding['d_start']:padding['d_end']
+                ]
+                logger.info(f"Removed padding, unpadded shape: {unpadded_seg.shape}")
+            else:
+                unpadded_seg = cropped_seg
+            
+            # Place back at ROI location in training space
+            h_start = crop_coords['h_start']
+            h_end = crop_coords['h_end']
+            w_start = crop_coords['w_start'] 
+            w_end = crop_coords['w_end']
+            d_start = crop_coords['d_start']
+            d_end = crop_coords['d_end']
+            
+            # Ensure we don't exceed training space boundaries
+            actual_h_end = min(h_start + unpadded_seg.shape[0], training_shape[0])
+            actual_w_end = min(w_start + unpadded_seg.shape[1], training_shape[1])
+            actual_d_end = min(d_start + unpadded_seg.shape[2], training_shape[2])
+            
+            # Calculate how much to copy
+            copy_h = actual_h_end - h_start
+            copy_w = actual_w_end - w_start  
+            copy_d = actual_d_end - d_start
+            
+            # Place segmentation in training space
+            training_segmentation[h_start:actual_h_end, w_start:actual_w_end, d_start:actual_d_end] = \
+                unpadded_seg[:copy_h, :copy_w, :copy_d]
+            
+            logger.info(f"Reconstructed segmentation to training space: {training_segmentation.shape}")
+            
+            # Step 2: Expand from training space (128x128x128) back to original BraTS space (240x240x155)
+            final_segmentation = np.zeros(original_shape, dtype=cropped_seg.dtype)
+            
+            # Place training space segmentation back into original position [56:184, 56:184, 13:141]
+            final_segmentation[56:184, 56:184, 13:141] = training_segmentation
+            
+            logger.info(f"Final segmentation shape: {final_segmentation.shape}")
+            logger.info(f"Final segmentation unique values: {np.unique(final_segmentation)}")
+            
+            # Calculate tumor volume statistics
+            non_bg_voxels = np.sum(final_segmentation > 0)
+            total_voxels = final_segmentation.size
+            tumor_percentage = (non_bg_voxels / total_voxels) * 100
+            logger.info(f"Tumor voxels: {non_bg_voxels}/{total_voxels} ({tumor_percentage:.2f}%)")
+            
+            return final_segmentation
+            
+        except Exception as e:
+            logger.error(f"Error in training-style postprocessing: {e}")
+            raise
 
     def preprocess_data(self, data_dict, patient_id):
         """Preprocess MRI data following the training pipeline."""
@@ -736,14 +1088,25 @@ class BrainTumorSegmentationTester:
         logger.info(f"Generating multiclass segmentation for {patient_id}")
         
         try:
-            # The model expects 4 channels (MRI modalities), not 5
-            # Extract only the first 4 channels (exclude binary mask)
-            if cropped_data.shape[-1] == 5:
-                mri_data = cropped_data[:, :, :, :4]  # Take only MRI channels
-                logger.info(f"Using MRI data shape: {mri_data.shape}")
+            logger.info(f"Input cropped data shape: {cropped_data.shape}")
+            
+            # The multiclass model expects 4 channels (MRI modalities only)
+            if cropped_data.shape[-1] == 4:
+                # Training-style preprocessing: already 4 channels
+                mri_data = cropped_data
+                logger.info(f"Using 4-channel MRI data shape: {mri_data.shape}")
+            elif cropped_data.shape[-1] == 5:
+                # Original preprocessing: extract only the first 4 channels (exclude binary mask)
+                mri_data = cropped_data[:, :, :, :4]
+                logger.info(f"Extracted 4-channel MRI data from 5-channel input: {mri_data.shape}")
             else:
                 logger.error(f"Unexpected cropped data shape: {cropped_data.shape}")
-                raise ValueError("Cropped data should have 5 channels (4 MRI + 1 binary)")
+                raise ValueError(f"Expected 4 or 5 channels, got {cropped_data.shape[-1]} channels")
+            
+            # Verify shape is exactly what multiclass model expects
+            if mri_data.shape != (48, 48, 128, 4):
+                logger.error(f"MRI data shape {mri_data.shape} doesn't match expected (48, 48, 128, 4)")
+                raise ValueError(f"MRI data must be exactly (48, 48, 128, 4), got {mri_data.shape}")
             
             # Prepare input for multiclass model (should be 48x48x128x4)
             img_input = np.expand_dims(mri_data, axis=0)
@@ -753,25 +1116,20 @@ class BrainTumorSegmentationTester:
             multiclass_pred = self.multiclass_model.predict(img_input, verbose=0)
             multiclass_prob = multiclass_pred[0]  # Shape: (48, 48, 128, 4)
             
+            logger.info(f"Multiclass prediction shape: {multiclass_pred.shape}")
+            logger.info(f"Multiclass probabilities shape: {multiclass_prob.shape}")
+            
             # Convert probabilities to class labels
             multiclass_seg = np.argmax(multiclass_prob, axis=-1)
             
             logger.info(f"Multiclass segmentation shape: {multiclass_seg.shape}")
             logger.info(f"Multiclass unique values: {np.unique(multiclass_seg)}")
             
-            # Convert to BraTS format (0, 1, 2, 4)
-            multiclass_brats = self.convert_to_brats_labels(multiclass_seg)
-            
             # Save intermediate multiclass results
             if self.save_intermediate:
                 self.save_intermediate_nifti(
                     multiclass_seg,
                     f"{patient_id}_multiclass_raw.nii.gz"
-                )
-                
-                self.save_intermediate_nifti(
-                    multiclass_brats,
-                    f"{patient_id}_multiclass_brats.nii.gz"
                 )
                 
                 # Save probabilities for each class
@@ -781,7 +1139,7 @@ class BrainTumorSegmentationTester:
                         f"{patient_id}_prob_class_{i}.nii.gz"
                     )
             
-            return multiclass_brats, multiclass_prob
+            return multiclass_seg, multiclass_prob
             
         except Exception as e:
             logger.error(f"Error in multiclass prediction: {e}")
@@ -1042,31 +1400,68 @@ class BrainTumorSegmentationTester:
             has_ground_truth = 'seg' in data_dict
             ground_truth = data_dict.get('seg', None)
             
-            # Preprocess
-            normalized_data, processed_mask = self.preprocess_data(data_dict, patient_id)
-            
-            # Generate binary mask
-            binary_mask = self.predict_binary_mask(normalized_data, patient_id)
-            
-            # Crop using binary mask
-            cropped_data, cropped_mask, crop_coords = self.crop_with_binary_mask(
-                normalized_data, processed_mask, binary_mask, patient_id
-            )
-            
-            # Generate multiclass segmentation
-            multiclass_seg, multiclass_prob = self.predict_multiclass(cropped_data, patient_id)
-            
-            # Postprocess to original size
-            final_segmentation = self.postprocess_segmentation(
-                multiclass_seg, crop_coords, patient_id
-            )
+            # Choose preprocessing pipeline
+            if self.use_training_style_preprocessing:
+                logger.info(f"Using TRAINING-STYLE preprocessing pipeline for {patient_id}")
+                
+                # Preprocess using training-style pipeline
+                normalized_data, processed_mask, crop_indices = self.preprocess_data_training_style(data_dict, patient_id)
+                
+                # Generate binary mask (training-style: expects 128x128x128x4)
+                binary_mask = self.predict_binary_mask_training_style(normalized_data, patient_id)
+                
+                # Crop using binary mask (training-style: ROI crop to 48x48x128x4)
+                cropped_data, cropped_mask, crop_coords = self.crop_with_binary_mask_training_style(
+                    normalized_data, processed_mask, binary_mask, patient_id
+                )
+                
+                # Generate multiclass segmentation
+                multiclass_seg, multiclass_prob = self.predict_multiclass(cropped_data, patient_id)
+                
+                # Convert to BraTS format (0, 1, 2, 4) - convert label 3 back to 4
+                multiclass_seg[multiclass_seg == 3] = 4
+                
+                # Postprocess to original BraTS size (training-style: 48x48x128 -> 128x128x128 -> 240x240x155)
+                original_shape = data_dict['t1'].shape  # Original BraTS shape
+                final_segmentation = self.postprocess_segmentation_training_style(
+                    multiclass_seg, crop_coords, original_shape, patient_id
+                )
+                
+                # Also reconstruct binary mask to original space for evaluation
+                binary_mask_full = np.zeros(original_shape, dtype=np.uint8)
+                binary_mask_full[56:184, 56:184, 13:141] = binary_mask
+                
+            else:
+                logger.info(f"Using ORIGINAL preprocessing pipeline for {patient_id}")
+                
+                # Original preprocessing pipeline
+                normalized_data, processed_mask = self.preprocess_data(data_dict, patient_id)
+                
+                # Generate binary mask
+                binary_mask_full = self.predict_binary_mask(normalized_data, patient_id)
+                
+                # Crop using binary mask
+                cropped_data, cropped_mask, crop_coords = self.crop_with_binary_mask(
+                    normalized_data, processed_mask, binary_mask_full, patient_id
+                )
+                
+                # Generate multiclass segmentation
+                multiclass_seg, multiclass_prob = self.predict_multiclass(cropped_data, patient_id)
+                
+                # Convert to BraTS format (0, 1, 2, 4)
+                multiclass_brats = self.convert_to_brats_labels(multiclass_seg)
+                
+                # Postprocess to original size
+                final_segmentation = self.postprocess_segmentation(
+                    multiclass_brats, crop_coords, patient_id
+                )
             
             # Evaluate predictions against ground truth if available
             evaluation_results = None
             if has_ground_truth:
                 try:
                     evaluation_results = self.evaluate_predictions(
-                        binary_mask, final_segmentation, ground_truth, patient_id
+                        binary_mask_full, final_segmentation, ground_truth, patient_id
                     )
                     logger.info(f"Evaluation completed for {patient_id}")
                 except Exception as e:
@@ -1091,7 +1486,7 @@ class BrainTumorSegmentationTester:
             if self.use_ground_truth_space:
                 try:
                     resampled_paths, resampled_data = self.save_resampled_predictions(
-                        binary_mask, final_segmentation, ants_images, patient_id
+                        binary_mask_full, final_segmentation, ants_images, patient_id
                     )
                     logger.info("Successfully resampled predictions to reference space")
                     
@@ -1139,7 +1534,8 @@ class BrainTumorSegmentationTester:
                 'prediction_path': str(prediction_path),
                 'processing_time': processing_time,
                 'report': report,
-                'evaluation': evaluation_results
+                'evaluation': evaluation_results,
+                'preprocessing_style': 'training-style' if self.use_training_style_preprocessing else 'original'
             }
             
             # Add resampled paths if available
@@ -1230,6 +1626,8 @@ def main():
                        help='Skip saving intermediate results')
     parser.add_argument('--no_resampling', action='store_true',
                        help='Skip ANTs resampling to ground truth space')
+    parser.add_argument('--use_original_preprocessing', action='store_true',
+                       help='Use original preprocessing instead of training-style preprocessing')
     
     args = parser.parse_args()
     
@@ -1240,7 +1638,8 @@ def main():
         binary_weights=args.binary_weights,
         multiclass_weights=args.multiclass_weights,
         save_intermediate=not args.no_intermediate,
-        use_ground_truth_space=not args.no_resampling
+        use_ground_truth_space=not args.no_resampling,
+        use_training_style_preprocessing=not args.use_original_preprocessing
     )
     
     # Run inference
