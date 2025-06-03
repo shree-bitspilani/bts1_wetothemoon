@@ -1104,139 +1104,347 @@ class BrainTumorSegmentationTester:
             logger.error(f"Error in cropping: {e}")
             raise
     
-    def predict_multiclass(self, cropped_data, patient_id):
-        """Generate multiclass segmentation using the attention model."""
-        logger.info(f"Generating multiclass segmentation for {patient_id}")
+    def create_sliding_windows(self, binary_mask, window_size=(48, 48, 128), stride=(24, 24, 64)):
+        """
+        Create sliding windows from binary mask for multiclass prediction.
+        
+        Args:
+            binary_mask: Binary mask indicating tumor regions
+            window_size: Size of each window (h, w, d)
+            stride: Stride for sliding window (h, w, d)
+            
+        Returns:
+            windows: List of window coordinates and binary mask patches
+        """
+        logger.info("Creating sliding windows for multiclass prediction")
+        
+        h, w, d = binary_mask.shape
+        window_h, window_w, window_d = window_size
+        stride_h, stride_w, stride_d = stride
+        
+        windows = []
+        
+        # Create windows with overlap
+        for i in range(0, h - window_h + 1, stride_h):
+            for j in range(0, w - window_w + 1, stride_w):
+                for k in range(0, d - window_d + 1, stride_d):
+                    # Extract window
+                    window = binary_mask[i:i+window_h, j:j+window_w, k:k+window_d]
+                    
+                    # Only consider windows with tumor presence
+                    if np.sum(window > 0) > 0:
+                        windows.append({
+                            'coords': (i, j, k),
+                            'window': window,
+                            'has_tumor': True
+                        })
+        
+        logger.info(f"Created {len(windows)} windows with tumor presence")
+        return windows
+
+    def predict_multiclass_sliding_window(self, normalized_data, binary_mask, patient_id):
+        """
+        Generate multiclass segmentation using sliding window approach.
+        
+        Args:
+            normalized_data: Normalized MRI data (128x128x128x4)
+            binary_mask: Binary mask indicating tumor regions (128x128x128)
+            patient_id: Patient identifier
+            
+        Returns:
+            final_segmentation: Combined multiclass segmentation
+            window_predictions: List of individual window predictions
+        """
+        logger.info(f"Generating multiclass segmentation using sliding window for {patient_id}")
         
         try:
-            logger.info(f"Input cropped data shape: {cropped_data.shape}")
+            # Initialize arrays for reconstruction
+            h, w, d = binary_mask.shape
+            prediction_counts = np.zeros((h, w, d, 4), dtype=np.float32)  # For probability accumulation
+            overlap_counts = np.zeros((h, w, d), dtype=np.int32)  # For averaging
+            window_predictions = []
             
-            # The multiclass model expects 4 channels (MRI modalities only)
-            if cropped_data.shape[-1] == 4:
-                # Training-style preprocessing: already 4 channels
-                mri_data = cropped_data
-                logger.info(f"Using 4-channel MRI data shape: {mri_data.shape}")
-            elif cropped_data.shape[-1] == 5:
-                # Original preprocessing: extract only the first 4 channels (exclude binary mask)
-                mri_data = cropped_data[:, :, :, :4]
-                logger.info(f"Extracted 4-channel MRI data from 5-channel input: {mri_data.shape}")
-            else:
-                logger.error(f"Unexpected cropped data shape: {cropped_data.shape}")
-                raise ValueError(f"Expected 4 or 5 channels, got {cropped_data.shape[-1]} channels")
+            # Define window size and stride
+            window_size = (48, 48, 128)  # Fixed size for multiclass model
+            stride = (24, 24, 64)  # 50% overlap in height and width, no overlap in depth
             
-            # Verify shape is exactly what multiclass model expects
-            if mri_data.shape != (48, 48, 128, 4):
-                logger.error(f"MRI data shape {mri_data.shape} doesn't match expected (48, 48, 128, 4)")
-                raise ValueError(f"MRI data must be exactly (48, 48, 128, 4), got {mri_data.shape}")
+            # Create sliding windows
+            for i in range(0, h - window_size[0] + 1, stride[0]):
+                for j in range(0, w - window_size[1] + 1, stride[1]):
+                    for k in range(0, d - window_size[2] + 1, stride[2]):
+                        # Extract window from binary mask
+                        window_binary = binary_mask[i:i+window_size[0], j:j+window_size[1], k:k+window_size[2]]
+                        
+                        # Only process windows with tumor presence
+                        if np.sum(window_binary > 0) > 0:
+                            # Extract corresponding region from normalized data
+                            window_data = normalized_data[i:i+window_size[0], j:j+window_size[1], k:k+window_size[2]]
+                            
+                            # Prepare input for multiclass model
+                            img_input = np.expand_dims(window_data, axis=0)
+                            
+                            # Predict
+                            multiclass_pred = self.multiclass_model.predict(img_input, verbose=0)
+                            multiclass_prob = multiclass_pred[0]  # Shape: (48, 48, 128, 4)
+                            
+                            # Store window prediction
+                            window_predictions.append({
+                                'coords': (i, j, k),
+                                'probabilities': multiclass_prob
+                            })
+                            
+                            # Add probabilities to accumulation
+                            prediction_counts[i:i+window_size[0], j:j+window_size[1], k:k+window_size[2]] += multiclass_prob
+                            overlap_counts[i:i+window_size[0], j:j+window_size[1], k:k+window_size[2]] += 1
+                            
+                            logger.info(f"Processed window at ({i}, {j}, {k})")
             
-            # Prepare input for multiclass model (should be 48x48x128x4)
-            img_input = np.expand_dims(mri_data, axis=0)
-            logger.info(f"Model input shape: {img_input.shape}")
+            if not window_predictions:
+                logger.warning(f"No tumor regions found in binary mask for {patient_id}")
+                return np.zeros(binary_mask.shape, dtype=np.uint8), []
             
-            # Predict
-            multiclass_pred = self.multiclass_model.predict(img_input, verbose=0)
-            multiclass_prob = multiclass_pred[0]  # Shape: (48, 48, 128, 4)
-            
-            logger.info(f"Multiclass prediction shape: {multiclass_pred.shape}")
-            logger.info(f"Multiclass probabilities shape: {multiclass_prob.shape}")
+            # Average probabilities where windows overlap
+            overlap_mask = overlap_counts > 0
+            prediction_counts[overlap_mask] /= overlap_counts[overlap_mask][..., np.newaxis]
             
             # Convert probabilities to class labels
-            multiclass_seg = np.argmax(multiclass_prob, axis=-1)
+            final_segmentation = np.argmax(prediction_counts, axis=-1)
             
-            logger.info(f"Multiclass segmentation shape: {multiclass_seg.shape}")
-            logger.info(f"Multiclass unique values: {np.unique(multiclass_seg)}")
+            # Convert to BraTS format (0, 1, 2, 4)
+            final_segmentation[final_segmentation == 3] = 4
             
-            # Save intermediate multiclass results
+            logger.info(f"Final segmentation shape: {final_segmentation.shape}")
+            logger.info(f"Final segmentation unique values: {np.unique(final_segmentation)}")
+            
+            # Save intermediate results
             if self.save_intermediate:
+                # Save final segmentation
                 self.save_intermediate_nifti(
-                    multiclass_seg,
-                    f"{patient_id}_multiclass_raw.nii.gz"
+                    final_segmentation,
+                    f"{patient_id}_multiclass_sliding_window.nii.gz"
                 )
                 
-                # Save probabilities for each class
-                for i in range(multiclass_prob.shape[-1]):
+                # Save individual window predictions
+                for idx, pred in enumerate(window_predictions):
+                    window_seg = np.argmax(pred['probabilities'], axis=-1)
+                    window_seg[window_seg == 3] = 4  # Convert to BraTS format
                     self.save_intermediate_nifti(
-                        multiclass_prob[:, :, :, i],
-                        f"{patient_id}_prob_class_{i}.nii.gz"
+                        window_seg,
+                        f"{patient_id}_window_{idx}_seg.nii.gz"
                     )
             
-            return multiclass_seg, multiclass_prob
+            return final_segmentation, window_predictions
             
         except Exception as e:
-            logger.error(f"Error in multiclass prediction: {e}")
+            logger.error(f"Error in sliding window multiclass prediction: {e}")
             raise
-    
-    def convert_to_brats_labels(self, segmentation):
-        """Convert model output to BraTS label format."""
-        # Model outputs 0, 1, 2, 3 -> Convert to BraTS format 0, 1, 2, 4
-        brats_seg = segmentation.copy()
-        brats_seg[segmentation == 3] = 4  # ET class becomes label 4
-        return brats_seg
-    
-    def postprocess_segmentation(self, cropped_seg, crop_coords, patient_id):
-        """Postprocess segmentation to original size using stored crop coordinates."""
-        logger.info(f"Postprocessing segmentation for {patient_id}")
+
+    def process_patient(self, patient_dir):
+        """Process a single patient through the complete pipeline."""
+        start_time = datetime.now()
         
         try:
-            original_shape = crop_coords['original_shape']
-            logger.info(f"Reconstructing to original shape: {original_shape}")
+            # Load patient data including ground truth
+            data_dict, headers, ants_images, patient_id = self.load_patient_data(patient_dir)
             
-            # Initialize full-size segmentation with background (0)
-            full_segmentation = np.zeros(original_shape, dtype=cropped_seg.dtype)
+            # Check if ground truth is available
+            has_ground_truth = 'seg' in data_dict
+            ground_truth = data_dict.get('seg', None)
             
-            # Handle padding if it was applied during cropping
-            if 'padding' in crop_coords:
-                # Remove padding from cropped segmentation first
-                padding = crop_coords['padding']
-                unpadded_seg = cropped_seg[
-                    padding['h_start']:padding['h_end'],
-                    padding['w_start']:padding['w_end'], 
-                    padding['d_start']:padding['d_end']
-                ]
-                logger.info(f"Removed padding, unpadded shape: {unpadded_seg.shape}")
+            # Choose preprocessing pipeline
+            if self.use_training_style_preprocessing:
+                logger.info(f"Using TRAINING-STYLE preprocessing pipeline for {patient_id}")
+                
+                # Preprocess using training-style pipeline
+                normalized_data, processed_mask, crop_indices = self.preprocess_data_training_style(data_dict, patient_id)
+                
+                # Generate binary mask (training-style: expects 128x128x128x4)
+                binary_mask = self.predict_binary_mask_training_style(normalized_data, patient_id)
+                
+                # Use sliding window approach for multiclass prediction
+                final_segmentation, window_predictions = self.predict_multiclass_sliding_window(
+                    normalized_data, binary_mask, patient_id
+                )
+                
+                # Reconstruct to original space
+                original_shape = data_dict['t1'].shape
+                final_segmentation_full = np.zeros(original_shape, dtype=np.uint8)
+                final_segmentation_full[56:184, 56:184, 13:141] = final_segmentation
+                
+                # Also reconstruct binary mask to original space for evaluation
+                binary_mask_full = np.zeros(original_shape, dtype=np.uint8)
+                binary_mask_full[56:184, 56:184, 13:141] = binary_mask
+                
             else:
-                unpadded_seg = cropped_seg
+                logger.info(f"Using ORIGINAL preprocessing pipeline for {patient_id}")
+                
+                # Original preprocessing pipeline
+                normalized_data, processed_mask = self.preprocess_data(data_dict, patient_id)
+                
+                # Generate binary mask
+                binary_mask_full = self.predict_binary_mask(normalized_data, patient_id)
+                
+                # Use sliding window approach for multiclass prediction
+                final_segmentation, window_predictions = self.predict_multiclass_sliding_window(
+                    normalized_data, binary_mask_full, patient_id
+                )
+                final_segmentation_full = final_segmentation
             
-            # Place the segmentation back at the original crop location
-            h_start = crop_coords['h_start']
-            h_end = crop_coords['h_end']
-            w_start = crop_coords['w_start'] 
-            w_end = crop_coords['w_end']
-            d_start = crop_coords['d_start']
-            d_end = crop_coords['d_end']
+            # Evaluate predictions against ground truth if available
+            evaluation_results = None
+            if has_ground_truth:
+                try:
+                    evaluation_results = self.evaluate_predictions(
+                        binary_mask_full, final_segmentation_full, ground_truth, patient_id
+                    )
+                    logger.info(f"Evaluation completed for {patient_id}")
+                except Exception as e:
+                    logger.warning(f"Evaluation failed for {patient_id}: {e}")
+                    evaluation_results = {
+                        'has_ground_truth': True,
+                        'evaluation_error': str(e)
+                    }
+            else:
+                logger.info(f"No ground truth available for {patient_id}, skipping evaluation")
+                evaluation_results = {'has_ground_truth': False}
             
-            # Ensure we don't exceed original boundaries
-            actual_h_end = min(h_start + unpadded_seg.shape[0], original_shape[0])
-            actual_w_end = min(w_start + unpadded_seg.shape[1], original_shape[1])
-            actual_d_end = min(d_start + unpadded_seg.shape[2], original_shape[2])
+            # Save final prediction in original processing space
+            prediction_path = self.save_final_prediction(
+                final_segmentation_full, patient_id, headers['t1']
+            )
             
-            # Calculate how much of the unpadded segmentation to copy
-            copy_h = actual_h_end - h_start
-            copy_w = actual_w_end - w_start  
-            copy_d = actual_d_end - d_start
+            # Resample predictions to ground truth space using ANTs
+            resampled_paths = {}
+            resampled_data = None
             
-            logger.info(f"Placing segmentation at [{h_start}:{actual_h_end}, {w_start}:{actual_w_end}, {d_start}:{actual_d_end}]")
-            logger.info(f"Copying from unpadded_seg: [{0}:{copy_h}, {0}:{copy_w}, {0}:{copy_d}]")
+            if self.use_ground_truth_space:
+                try:
+                    resampled_paths, resampled_data = self.save_resampled_predictions(
+                        binary_mask_full, final_segmentation_full, ants_images, patient_id
+                    )
+                    logger.info("Successfully resampled predictions to reference space")
+                    
+                    # Evaluate resampled predictions if ground truth is available
+                    if has_ground_truth and 'evaluation_error' not in evaluation_results:
+                        try:
+                            # Get ground truth in the same space as resampled predictions
+                            if 'seg' in ants_images:
+                                gt_resampled = ants_images['seg'].numpy()
+                            else:
+                                gt_resampled = ground_truth
+                            
+                            resampled_evaluation = self.evaluate_predictions(
+                                resampled_data['binary_resampled'],
+                                resampled_data['multiclass_resampled'],
+                                gt_resampled,
+                                f"{patient_id}_resampled"
+                            )
+                            
+                            # Add resampled evaluation to results
+                            evaluation_results['resampled_evaluation'] = {
+                                'binary_evaluation': resampled_evaluation['binary_evaluation'],
+                                'multiclass_evaluation': resampled_evaluation['multiclass_evaluation']
+                            }
+                            
+                        except Exception as e:
+                            logger.warning(f"Resampled evaluation failed for {patient_id}: {e}")
+                            evaluation_results['resampled_evaluation_error'] = str(e)
+                            
+                except Exception as e:
+                    logger.warning(f"Failed to resample predictions: {e}")
+                    logger.info("Continuing with original predictions only")
             
-            # Place the segmentation
-            full_segmentation[h_start:actual_h_end, w_start:actual_w_end, d_start:actual_d_end] = \
-                unpadded_seg[:copy_h, :copy_w, :copy_d]
+            # Generate report with evaluation information
+            processing_time = (datetime.now() - start_time).total_seconds()
+            report = self.generate_summary_report(
+                patient_id, final_segmentation_full, processing_time, resampled_data, evaluation_results
+            )
             
-            logger.info(f"Final segmentation shape: {full_segmentation.shape}")
-            logger.info(f"Final segmentation unique values: {np.unique(full_segmentation)}")
+            logger.info(f"Successfully processed {patient_id} in {processing_time:.2f} seconds")
             
-            # Calculate tumor volume statistics
-            non_bg_voxels = np.sum(full_segmentation > 0)
-            total_voxels = full_segmentation.size
-            tumor_percentage = (non_bg_voxels / total_voxels) * 100
-            logger.info(f"Tumor voxels: {non_bg_voxels}/{total_voxels} ({tumor_percentage:.2f}%)")
+            result = {
+                'patient_id': patient_id,
+                'success': True,
+                'prediction_path': str(prediction_path),
+                'processing_time': processing_time,
+                'report': report,
+                'evaluation': evaluation_results,
+                'preprocessing_style': 'training-style' if self.use_training_style_preprocessing else 'original',
+                'num_windows': len(window_predictions)
+            }
             
-            return full_segmentation
+            # Add resampled paths if available
+            if resampled_paths:
+                result['resampled_paths'] = resampled_paths
+            
+            return result
             
         except Exception as e:
-            logger.error(f"Error in postprocessing: {e}")
-            raise
+            processing_time = (datetime.now() - start_time).total_seconds()
+            logger.error(f"Failed to process {patient_dir}: {e}")
+            
+            return {
+                'patient_id': getattr(self, 'current_patient_id', str(patient_dir)),
+                'success': False,
+                'error': str(e),
+                'processing_time': processing_time
+            }
     
+    def run_inference(self):
+        """Run inference on all patients in test_dir."""
+        logger.info("Starting inference on test data...")
+        
+        # Load models
+        self.load_models()
+        
+        # Find all patient directories
+        patient_dirs = [d for d in self.test_dir.iterdir() if d.is_dir()]
+        
+        if not patient_dirs:
+            logger.warning(f"No patient directories found in {self.test_dir}")
+            return
+        
+        logger.info(f"Found {len(patient_dirs)} patient directories")
+        
+        results = []
+        successful = 0
+        failed = 0
+        
+        for patient_dir in patient_dirs:
+            logger.info(f"\n{'='*50}")
+            logger.info(f"Processing {patient_dir.name}")
+            logger.info(f"{'='*50}")
+            
+            result = self.process_patient(patient_dir)
+            results.append(result)
+            
+            if result['success']:
+                successful += 1
+            else:
+                failed += 1
+        
+        # Generate overall summary
+        summary = {
+            'total_patients': len(patient_dirs),
+            'successful': successful,
+            'failed': failed,
+            'results': results,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        summary_path = self.output_dir / 'inference_summary.json'
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"INFERENCE COMPLETE")
+        logger.info(f"{'='*60}")
+        logger.info(f"Total patients: {len(patient_dirs)}")
+        logger.info(f"Successful: {successful}")
+        logger.info(f"Failed: {failed}")
+        logger.info(f"Results saved to: {self.output_dir}")
+        logger.info(f"Summary: {summary_path}")
+
     def save_intermediate_nifti(self, data, filename, reference_header=None):
         """Save intermediate results as NIfTI files."""
         try:
@@ -1250,7 +1458,7 @@ class BrainTumorSegmentationTester:
             
         except Exception as e:
             logger.error(f"Error saving intermediate file {filename}: {e}")
-    
+
     def save_final_prediction(self, segmentation, patient_id, reference_header=None):
         """Save final prediction as NIfTI file."""
         try:
@@ -1328,7 +1536,7 @@ class BrainTumorSegmentationTester:
         except Exception as e:
             logger.error(f"Error saving resampled predictions: {e}")
             raise
-    
+
     def generate_summary_report(self, patient_id, segmentation, processing_time, resampled_data=None, evaluation_results=None):
         """Generate a summary report for the processed patient."""
         try:
@@ -1408,228 +1616,6 @@ class BrainTumorSegmentationTester:
         except Exception as e:
             logger.error(f"Error generating report: {e}")
             return None
-    
-    def process_patient(self, patient_dir):
-        """Process a single patient through the complete pipeline."""
-        start_time = datetime.now()
-        
-        try:
-            # Load patient data including ground truth
-            data_dict, headers, ants_images, patient_id = self.load_patient_data(patient_dir)
-            
-            # Check if ground truth is available
-            has_ground_truth = 'seg' in data_dict
-            ground_truth = data_dict.get('seg', None)
-            
-            # Choose preprocessing pipeline
-            if self.use_training_style_preprocessing:
-                logger.info(f"Using TRAINING-STYLE preprocessing pipeline for {patient_id}")
-                
-                # Preprocess using training-style pipeline
-                normalized_data, processed_mask, crop_indices = self.preprocess_data_training_style(data_dict, patient_id)
-                
-                # Generate binary mask (training-style: expects 128x128x128x4)
-                binary_mask = self.predict_binary_mask_training_style(normalized_data, patient_id)
-                
-                # Crop using binary mask (training-style: ROI crop to 48x48x128x4)
-                cropped_data, cropped_mask, crop_coords = self.crop_with_binary_mask_training_style(
-                    normalized_data, processed_mask, binary_mask, patient_id
-                )
-                
-                # Generate multiclass segmentation
-                multiclass_seg, multiclass_prob = self.predict_multiclass(cropped_data, patient_id)
-                
-                # Convert to BraTS format (0, 1, 2, 4) - convert label 3 back to 4
-                multiclass_seg[multiclass_seg == 3] = 4
-                
-                # Postprocess to original BraTS size (training-style: 48x48x128 -> 128x128x128 -> 240x240x155)
-                original_shape = data_dict['t1'].shape  # Original BraTS shape
-                final_segmentation = self.postprocess_segmentation_training_style(
-                    multiclass_seg, crop_coords, original_shape, patient_id
-                )
-                
-                # Also reconstruct binary mask to original space for evaluation
-                binary_mask_full = np.zeros(original_shape, dtype=np.uint8)
-                binary_mask_full[56:184, 56:184, 13:141] = binary_mask
-                
-            else:
-                logger.info(f"Using ORIGINAL preprocessing pipeline for {patient_id}")
-                
-                # Original preprocessing pipeline
-                normalized_data, processed_mask = self.preprocess_data(data_dict, patient_id)
-                
-                # Generate binary mask
-                binary_mask_full = self.predict_binary_mask(normalized_data, patient_id)
-                
-                # Crop using binary mask
-                cropped_data, cropped_mask, crop_coords = self.crop_with_binary_mask(
-                    normalized_data, processed_mask, binary_mask_full, patient_id
-                )
-                
-                # Generate multiclass segmentation
-                multiclass_seg, multiclass_prob = self.predict_multiclass(cropped_data, patient_id)
-                
-                # Convert to BraTS format (0, 1, 2, 4)
-                multiclass_brats = self.convert_to_brats_labels(multiclass_seg)
-                
-                # Postprocess to original size
-                final_segmentation = self.postprocess_segmentation(
-                    multiclass_brats, crop_coords, patient_id
-                )
-            
-            # Evaluate predictions against ground truth if available
-            evaluation_results = None
-            if has_ground_truth:
-                try:
-                    evaluation_results = self.evaluate_predictions(
-                        binary_mask_full, final_segmentation, ground_truth, patient_id
-                    )
-                    logger.info(f"Evaluation completed for {patient_id}")
-                except Exception as e:
-                    logger.warning(f"Evaluation failed for {patient_id}: {e}")
-                    evaluation_results = {
-                        'has_ground_truth': True,
-                        'evaluation_error': str(e)
-                    }
-            else:
-                logger.info(f"No ground truth available for {patient_id}, skipping evaluation")
-                evaluation_results = {'has_ground_truth': False}
-            
-            # Save final prediction in original processing space
-            prediction_path = self.save_final_prediction(
-                final_segmentation, patient_id, headers['t1']
-            )
-            
-            # Resample predictions to ground truth space using ANTs
-            resampled_paths = {}
-            resampled_data = None
-            
-            if self.use_ground_truth_space:
-                try:
-                    resampled_paths, resampled_data = self.save_resampled_predictions(
-                        binary_mask_full, final_segmentation, ants_images, patient_id
-                    )
-                    logger.info("Successfully resampled predictions to reference space")
-                    
-                    # Evaluate resampled predictions if ground truth is available
-                    if has_ground_truth and 'evaluation_error' not in evaluation_results:
-                        try:
-                            # Get ground truth in the same space as resampled predictions
-                            if 'seg' in ants_images:
-                                gt_resampled = ants_images['seg'].numpy()
-                            else:
-                                gt_resampled = ground_truth
-                            
-                            resampled_evaluation = self.evaluate_predictions(
-                                resampled_data['binary_resampled'],
-                                resampled_data['multiclass_resampled'],
-                                gt_resampled,
-                                f"{patient_id}_resampled"
-                            )
-                            
-                            # Add resampled evaluation to results
-                            evaluation_results['resampled_evaluation'] = {
-                                'binary_evaluation': resampled_evaluation['binary_evaluation'],
-                                'multiclass_evaluation': resampled_evaluation['multiclass_evaluation']
-                            }
-                            
-                        except Exception as e:
-                            logger.warning(f"Resampled evaluation failed for {patient_id}: {e}")
-                            evaluation_results['resampled_evaluation_error'] = str(e)
-                            
-                except Exception as e:
-                    logger.warning(f"Failed to resample predictions: {e}")
-                    logger.info("Continuing with original predictions only")
-            
-            # Generate report with evaluation information
-            processing_time = (datetime.now() - start_time).total_seconds()
-            report = self.generate_summary_report(
-                patient_id, final_segmentation, processing_time, resampled_data, evaluation_results
-            )
-            
-            logger.info(f"Successfully processed {patient_id} in {processing_time:.2f} seconds")
-            
-            result = {
-                'patient_id': patient_id,
-                'success': True,
-                'prediction_path': str(prediction_path),
-                'processing_time': processing_time,
-                'report': report,
-                'evaluation': evaluation_results,
-                'preprocessing_style': 'training-style' if self.use_training_style_preprocessing else 'original'
-            }
-            
-            # Add resampled paths if available
-            if resampled_paths:
-                result['resampled_paths'] = resampled_paths
-            
-            return result
-            
-        except Exception as e:
-            processing_time = (datetime.now() - start_time).total_seconds()
-            logger.error(f"Failed to process {patient_dir}: {e}")
-            
-            return {
-                'patient_id': getattr(self, 'current_patient_id', str(patient_dir)),
-                'success': False,
-                'error': str(e),
-                'processing_time': processing_time
-            }
-    
-    def run_inference(self):
-        """Run inference on all patients in test_dir."""
-        logger.info("Starting inference on test data...")
-        
-        # Load models
-        self.load_models()
-        
-        # Find all patient directories
-        patient_dirs = [d for d in self.test_dir.iterdir() if d.is_dir()]
-        
-        if not patient_dirs:
-            logger.warning(f"No patient directories found in {self.test_dir}")
-            return
-        
-        logger.info(f"Found {len(patient_dirs)} patient directories")
-        
-        results = []
-        successful = 0
-        failed = 0
-        
-        for patient_dir in patient_dirs:
-            logger.info(f"\n{'='*50}")
-            logger.info(f"Processing {patient_dir.name}")
-            logger.info(f"{'='*50}")
-            
-            result = self.process_patient(patient_dir)
-            results.append(result)
-            
-            if result['success']:
-                successful += 1
-            else:
-                failed += 1
-        
-        # Generate overall summary
-        summary = {
-            'total_patients': len(patient_dirs),
-            'successful': successful,
-            'failed': failed,
-            'results': results,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        summary_path = self.output_dir / 'inference_summary.json'
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=2)
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"INFERENCE COMPLETE")
-        logger.info(f"{'='*60}")
-        logger.info(f"Total patients: {len(patient_dirs)}")
-        logger.info(f"Successful: {successful}")
-        logger.info(f"Failed: {failed}")
-        logger.info(f"Results saved to: {self.output_dir}")
-        logger.info(f"Summary: {summary_path}")
 
 
 def main():
