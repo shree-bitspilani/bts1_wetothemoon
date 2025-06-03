@@ -224,7 +224,8 @@ class BrainTumorSegmentationTester:
 
     def calculate_dice_coefficient(self, y_true, y_pred):
         """
-        Calculate Dice coefficient for binary segmentation.
+        Calculate Dice coefficient for binary segmentation using Keras backend operations.
+        Based on metric.py implementation.
         
         Args:
             y_true: Ground truth binary mask
@@ -234,22 +235,30 @@ class BrainTumorSegmentationTester:
             dice_score: Dice coefficient (0-1, higher is better)
         """
         # Ensure binary masks
-        y_true = (y_true > 0).astype(np.uint8)
-        y_pred = (y_pred > 0).astype(np.uint8)
+        y_true = (y_true > 0).astype(np.float32)
+        y_pred = (y_pred > 0).astype(np.float32)
         
-        intersection = np.sum(y_true * y_pred)
-        union = np.sum(y_true) + np.sum(y_pred)
+        # Flatten arrays
+        y_true_f = y_true.flatten()
+        y_pred_f = y_pred.flatten()
+        
+        # Calculate intersection and sums
+        intersection = np.sum(y_true_f * y_pred_f)
+        union = np.sum(y_true_f) + np.sum(y_pred_f)
         
         if union == 0:
             # Both masks are empty, perfect match
             return 1.0
         
-        dice = (2.0 * intersection) / union
+        # Calculate dice with smooth=1 as in metric.py
+        smooth = 1
+        dice = (2.0 * intersection + smooth) / (union + smooth)
         return float(dice)
 
     def calculate_multiclass_dice(self, y_true, y_pred, classes=None):
         """
         Calculate Dice coefficient for each class in multiclass segmentation.
+        Based on metric.py implementation for multilabel dice.
         
         Args:
             y_true: Ground truth segmentation with class labels
@@ -265,12 +274,24 @@ class BrainTumorSegmentationTester:
         
         dice_scores = {}
         
+        # Convert to one-hot encoding for each class
         for class_id in classes:
-            # Create binary masks for current class
-            true_class = (y_true == class_id).astype(np.uint8)
-            pred_class = (y_pred == class_id).astype(np.uint8)
+            if class_id == 0:  # Skip background
+                continue
             
-            dice_score = self.calculate_dice_coefficient(true_class, pred_class)
+            # Create binary masks for current class
+            true_class = (y_true == class_id).astype(np.float32)
+            pred_class = (y_pred == class_id).astype(np.float32)
+            
+            # Calculate dice using Keras-style implementation
+            true_f = true_class.flatten()
+            pred_f = pred_class.flatten()
+            
+            intersection = np.sum(true_f * pred_f)
+            union = np.sum(true_f) + np.sum(pred_f)
+            
+            smooth = 1
+            dice_score = (2.0 * intersection + smooth) / (union + smooth) if union > 0 else 1.0
             
             class_name = self.label_mapping.get(int(class_id), f"Class_{class_id}")
             dice_scores[int(class_id)] = {
