@@ -14,10 +14,13 @@ Usage:
 """
 
 import sys
+import time
 import numpy as np
 import nibabel as nib
 from typing import Dict, Tuple, Optional
 
+# Start timing
+start_time = time.time()
 # ============================================================================
 # CONFIGURATION - MODIFY THESE SETTINGS
 # ============================================================================
@@ -267,6 +270,11 @@ def main():
         except ImportError:
             print("\nWarning: pandas not available. CSV export requires pandas.")
             print("Install with: pip install pandas")
+
+            # Calculate and print execution time
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"\nTotal execution time: {execution_time/60:.2f} minutes")
     
     return results
 
